@@ -1,0 +1,16 @@
+name: build-and-test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  c11:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: make
+      - name: Test
+        run: timeout 20s make test
