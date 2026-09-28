@@ -1,11 +1,11 @@
-name: build-and-test
+name: build
 
 on:
   push:
   pull_request:
 
 jobs:
-  c11:
+  linux:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
