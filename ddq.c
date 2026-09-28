@@ -407,7 +407,8 @@ static int ensure_directory(const char *directory)
     int status;
     status = DDQ_OK;
     if (stat(directory, &st) != 0) {
-        if (errno == ENOENT && mkdir(directory, 0755) == 0) {
+        /* 队列载荷可能包含车辆和交易信息，新建目录只允许运行用户访问。 */
+        if (errno == ENOENT && mkdir(directory, 0700) == 0) {
             status = DDQ_OK;
         } else {
             status = DDQ_IO_ERROR;
@@ -431,7 +432,8 @@ static int create_segment(ddq_t *queue, uint64_t id)
                DDQ_OK) {
         status = DDQ_TOO_LARGE;
     } else {
-        fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_APPEND, 0644);
+        /* 段文件和恢复锁只保存本进程的投递数据，禁止其他用户读取。 */
+        fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_APPEND, 0600);
         if (fd < 0) {
             status = DDQ_IO_ERROR;
         } else if (sync_directory(queue->directory) != DDQ_OK) {
@@ -1026,7 +1028,7 @@ int ddq_open(ddq_t **out_queue, const char *directory,
                 if (written < 0 || (size_t)written >= sizeof(lock_path)) {
                     status = DDQ_TOO_LARGE;
                 } else {
-                    queue->lock_fd = open(lock_path, O_CREAT | O_RDWR, 0644);
+                    queue->lock_fd = open(lock_path, O_CREAT | O_RDWR, 0600);
                     if (queue->lock_fd < 0) {
                         status = DDQ_IO_ERROR;
                     } else if (flock(queue->lock_fd,
