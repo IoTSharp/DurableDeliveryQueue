@@ -67,6 +67,13 @@ int ddq_options_default(ddq_options_t *options);
 int ddq_open(ddq_t **out_queue, const char *directory,
              const ddq_options_t *options);
 void ddq_close(ddq_t *queue);
+/* 可选模式：预先持有总段数个真实读写句柄及一个目录句柄，选项 ABI 不变。
+ * 启用后 enqueue、轮转、read、claim、ack 不再打开文件；容量用尽返回 DDQ_FULL。
+ * 此模式不自动压缩，启用前全 ACK 历史按既有流程回收并保留 next_seq。
+ * 全部回放后应关闭并重新打开、再次启用以重建储备；隔离项始终保留。
+ * 重复启用返回 DDQ_BAD_STATE；显式 recover 需资源恢复后执行并重新预留。
+ */
+int ddq_reserve_handles(ddq_t *queue, uint32_t total_segments);
 
 int ddq_recover(ddq_t *queue);
 /* 已回收的确认项读取或再次确认返回不存在，隔离项仍占真实容量。 */

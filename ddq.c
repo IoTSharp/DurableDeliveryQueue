@@ -146,9 +146,20 @@ typedef struct {
     uint64_t offset;
 } ddq_capacity_plan_t;
 
+/* 预留槽只拥有真实队列文件描述符；当前段与槽共享归属，禁止重复关闭。 */
+typedef struct {
+    int fd;
+    uint8_t owned;
+    uint8_t spare;
+} ddq_reserved_handle_t;
+
 struct ddq {
     int lock_fd;
     int current_fd;
+    int reserved_directory_fd;
+    ddq_reserved_handle_t *reserved_handles;
+    uint32_t reserved_segments;
+    uint32_t reserve_target;
     char directory[PATH_MAX];
     ddq_options_t options;
     ddq_segment_t *segments;
@@ -468,6 +479,37 @@ static int parse_segment_name(const char *name, uint64_t *out_generation,
     return status;
 }
 
+/* 预留文件采用活动段名加独立后缀，恢复扫描不能把空预留当成最后活动段。 */
+static int make_reserved_path(char *path, size_t capacity, const ddq_t *queue,
+                              uint64_t id)
+{
+    size_t length = 0U;
+    int status = make_segment_path(path, capacity, queue->directory,
+                                   queue->generation, id);
+    if (status == DDQ_OK) {
+        length = strlen(path);
+        if (length + sizeof(".reserve") > capacity) status = DDQ_TOO_LARGE;
+        else memcpy(path + length, ".reserve", sizeof(".reserve"));
+    }
+    return status;
+}
+
+/* 只识别本队列严格段名的预留后缀，不处理目录中的其他文件。 */
+static int parse_reserved_name(const char *name, uint64_t *generation,
+                               uint64_t *id)
+{
+    char active_name[PATH_MAX];
+    size_t length = strnlen(name, sizeof(active_name));
+    const size_t suffix = sizeof(".reserve") - 1U;
+    int status = DDQ_INVALID_ARGUMENT;
+    if (length < sizeof(active_name) && length > suffix &&
+        strcmp(name + length - suffix, ".reserve") == 0) {
+        memcpy(active_name, name, length - suffix);
+        active_name[length - suffix] = '\0';
+        status = parse_segment_name(active_name, generation, id);
+    }
+    return status;
+}
 static int compare_segments(const void *left, const void *right)
 {
     const ddq_segment_t *a;
@@ -597,6 +639,56 @@ static int sync_directory(const char *directory)
     return status;
 }
 
+/* 预留模式只使用已经打开的目录；普通实例保持原有目录同步行为。 */
+static int sync_queue_directory(const ddq_t *queue)
+{
+    int status = DDQ_OK;
+    if (queue->reserved_handles != NULL) {
+        if (fsync(queue->reserved_directory_fd) != 0) status = DDQ_IO_ERROR;
+    } else {
+        status = sync_directory(queue->directory);
+    }
+    return status;
+}
+
+/* 实际准入上限必须与已持有段数一致，不能承诺未打开的物理容量。 */
+static uint32_t writable_segment_limit(const ddq_t *queue)
+{
+    uint32_t limit = queue->options.max_segments;
+    if (queue->reserved_handles != NULL) limit = queue->reserved_segments;
+    return limit;
+}
+
+/* 当前段失效时同步清除预留槽归属，其余已打开段继续保留现场。 */
+static void close_current_segment(ddq_t *queue)
+{
+    if (queue->current_fd >= 0) {
+        if (queue->reserved_handles != NULL && queue->segment_count != 0U &&
+            queue->reserved_handles[queue->segment_count - 1U].owned != 0U &&
+            queue->reserved_handles[queue->segment_count - 1U].fd == queue->current_fd) {
+            queue->reserved_handles[queue->segment_count - 1U].owned = 0U;
+        }
+        close(queue->current_fd);
+        queue->current_fd = -1;
+    }
+}
+
+/* 长期持有的段必须仍属于同名文件；删除、替换或外部改长不能被当作持久成功。 */
+static int validate_held_segment(const ddq_t *queue, uint32_t index)
+{
+    struct stat held;
+    struct stat named;
+    int status = DDQ_OK;
+    if (fstat(queue->reserved_handles[index].fd, &held) != 0 ||
+        lstat(queue->segments[index].path, &named) != 0) status = DDQ_IO_ERROR;
+    else if (!S_ISREG(named.st_mode) || held.st_nlink == 0 ||
+             held.st_dev != named.st_dev || held.st_ino != named.st_ino ||
+             held.st_size < 0 || (uint64_t)held.st_size != queue->segments[index].size) {
+        errno = ESTALE;
+        status = DDQ_CORRUPT;
+    }
+    return status;
+}
 static int ensure_directory(const char *directory)
 {
     struct stat st;
@@ -793,6 +885,48 @@ static int publish_manifest(const ddq_t *snapshot, int *out_published)
     return status;
 }
 
+/* 关闭只回收本实例持有且仍为空的预留文件；未确认活动日志从不删除。 */
+static int close_reserved_handles(ddq_t *queue)
+{
+    struct stat held;
+    struct stat named;
+    char path[PATH_MAX];
+    uint32_t index;
+    uint64_t deadline = operation_deadline(DDQ_OPERATION_TIMEOUT_MS);
+    int removed = 0;
+    int status = DDQ_OK;
+    if (queue->reserved_handles != NULL) {
+        for (index = 0U; index < queue->reserved_segments; ++index) {
+            ddq_reserved_handle_t *handle = &queue->reserved_handles[index];
+            if (deadline_expired(deadline) != 0) status = DDQ_LIMIT;
+            if (handle->owned != 0U) {
+                if (handle->spare != 0U && status == DDQ_OK) {
+                    status = make_reserved_path(path, sizeof(path), queue, index);
+                    if (status == DDQ_OK) {
+                        if (fstat(handle->fd, &held) != 0) status = DDQ_IO_ERROR;
+                        else if (lstat(path, &named) != 0) {
+                            if (errno != ENOENT) status = DDQ_IO_ERROR;
+                        } else if (!S_ISREG(named.st_mode) || held.st_size != 0 ||
+                                   named.st_dev != held.st_dev || named.st_ino != held.st_ino) {
+                            status = DDQ_CORRUPT;
+                        } else if (unlink(path) != 0) status = DDQ_IO_ERROR;
+                        else removed = 1;
+                    }
+                }
+                /* 超时后停止文件回收，仍有界关闭每个自有句柄，避免泄漏。 */
+                close(handle->fd);
+                handle->owned = 0U;
+            }
+        }
+        if (removed != 0 && fsync(queue->reserved_directory_fd) != 0) status = DDQ_IO_ERROR;
+        if (queue->reserved_directory_fd >= 0) close(queue->reserved_directory_fd);
+        queue->reserved_directory_fd = -1;
+        free(queue->reserved_handles);
+        queue->reserved_handles = NULL;
+        queue->reserved_segments = 0U;
+    }
+    return status;
+}
 /* 先保留零代清单，再创建持久标记，迁移中断仍能恢复旧格式日志。 */
 static int prepare_manifest_format(ddq_t *queue)
 {
@@ -836,8 +970,7 @@ static int prepare_manifest_format(ddq_t *queue)
         }
     }
     if (status != DDQ_OK && queue->current_fd >= 0) {
-        close(queue->current_fd);
-        queue->current_fd = -1;
+        close_current_segment(queue);
     }
     return status;
 }
@@ -857,6 +990,7 @@ static int clean_obsolete_files(const ddq_t *queue)
     int done;
     int removed;
     int obsolete;
+    struct stat active_st;
     int status;
     directory = NULL;
     done = 0;
@@ -889,7 +1023,23 @@ static int clean_obsolete_files(const ddq_t *queue)
                     DDQ_OK && generation != queue->generation) {
                 obsolete = 1;
             }
-            if (obsolete != 0) {
+            /* 空预留可回收；激活崩溃窗口的非空别名仅在同 inode 活动段存在时回收。 */
+            if (parse_reserved_name(entry->d_name, &generation, &id) == DDQ_OK) {
+                char active_path[PATH_MAX];
+                status = make_metadata_path(path, sizeof(path), queue->directory, entry->d_name);
+                if (status == DDQ_OK && lstat(path, &st) != 0) status = DDQ_IO_ERROR;
+                if (status == DDQ_OK && !S_ISREG(st.st_mode)) status = DDQ_CORRUPT;
+                if (status == DDQ_OK && st.st_size == 0) obsolete = 1;
+                else if (status == DDQ_OK) {
+                    status = make_segment_path(active_path, sizeof(active_path), queue->directory, generation, id);
+                    if (status == DDQ_OK) {
+                        if (lstat(active_path, &active_st) != 0 || !S_ISREG(active_st.st_mode) ||
+                            active_st.st_dev != st.st_dev || active_st.st_ino != st.st_ino) status = DDQ_CORRUPT;
+                        else obsolete = 1;
+                    }
+                }
+            }
+            if (obsolete != 0 && status == DDQ_OK) {
                 status = make_metadata_path(path, sizeof(path),
                                             queue->directory, entry->d_name);
                 if (status == DDQ_OK) {
@@ -916,71 +1066,80 @@ static int clean_obsolete_files(const ddq_t *queue)
     return status;
 }
 
+/* 预留激活以硬链接防覆盖，目录同步成功后才允许记录写入，整个过程不申请句柄。 */
+static int activate_reserved_segment(ddq_t *queue, uint64_t id, const char *path,
+                                      int *out_fd)
+{
+    char spare_path[PATH_MAX];
+    struct stat held;
+    struct stat named;
+    ddq_reserved_handle_t *handle = &queue->reserved_handles[queue->segment_count];
+    int status = DDQ_OK;
+    *out_fd = -1;
+    if (id != queue->segment_count || handle->owned == 0U || handle->spare == 0U) status = DDQ_BAD_STATE;
+    if (status == DDQ_OK) status = make_reserved_path(spare_path, sizeof(spare_path), queue, id);
+    if (status == DDQ_OK) {
+        if (fstat(handle->fd, &held) != 0 || lstat(spare_path, &named) != 0) status = DDQ_IO_ERROR;
+        else if (!S_ISREG(named.st_mode) || held.st_size != 0 ||
+                 named.st_dev != held.st_dev || named.st_ino != held.st_ino) status = DDQ_CORRUPT;
+    }
+    if (status == DDQ_OK && link(spare_path, path) != 0) status = DDQ_IO_ERROR;
+    if (status == DDQ_OK) status = sync_queue_directory(queue);
+    if (status == DDQ_OK && unlink(spare_path) != 0) status = DDQ_IO_ERROR;
+    if (status == DDQ_OK) status = sync_queue_directory(queue);
+    if (status == DDQ_OK) {
+        handle->spare = 0U;
+        *out_fd = handle->fd;
+    }
+    return status;
+}
+
 static int create_segment(ddq_t *queue, uint64_t id)
 {
-    /* 暂存代由最终清单发布前统一同步目录，运行代仍逐段同步。 */
+    /* 暂存代由清单发布前同步；预留实例只激活已经持有的真实可写段。 */
     char path[PATH_MAX];
-    int fd;
-    int status;
-    status = DDQ_OK;
-    fd = -1;
-    if (queue->segment_count >= queue->options.max_segments) {
-        status = DDQ_LIMIT;
-    } else if (make_segment_path(path, sizeof(path), queue->directory,
-                                 queue->generation, id) !=
-               DDQ_OK) {
-        status = DDQ_TOO_LARGE;
-    } else {
-        /* 段文件和恢复锁只保存本进程的投递数据，禁止其他用户读取。 */
-        fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_APPEND, 0600);
-        if (fd < 0) {
-            status = DDQ_IO_ERROR;
-        } else if (queue->staging == 0 &&
-                   sync_directory(queue->directory) != DDQ_OK) {
-            status = DDQ_IO_ERROR;
-        }
+    int fd = -1;
+    int status = DDQ_OK;
+    if (queue->segment_count >= writable_segment_limit(queue)) status = queue->reserved_handles != NULL ? DDQ_FULL : DDQ_LIMIT;
+    else if (make_segment_path(path, sizeof(path), queue->directory, queue->generation, id) != DDQ_OK) status = DDQ_TOO_LARGE;
+    else if (queue->reserved_handles != NULL) status = activate_reserved_segment(queue, id, path, &fd);
+    else {
+        /* 段文件只保存本进程数据，普通实例保留独占创建与目录同步。 */
+        fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_APPEND | O_CLOEXEC, 0600);
+        if (fd < 0) status = DDQ_IO_ERROR;
+        else if (queue->staging == 0) status = sync_queue_directory(queue);
     }
     if (status == DDQ_OK) {
-        memcpy(queue->segments[queue->segment_count].path, path,
-               strlen(path) + 1U);
+        memcpy(queue->segments[queue->segment_count].path, path, strlen(path) + 1U);
         queue->segments[queue->segment_count].id = id;
         queue->segments[queue->segment_count].size = 0ULL;
         queue->segment_count += 1U;
         queue->current_fd = fd;
         queue->current_offset = 0ULL;
-    } else if (fd >= 0) {
-        close(fd);
-    }
+    } else if (fd >= 0 && queue->reserved_handles == NULL) close(fd);
     return status;
 }
 
 static int rotate_segment(ddq_t *queue)
 {
-    /* 达到段上限时保留当前描述符，由回收或恢复决定后续写入。 */
-    uint64_t next_id;
-    int status;
-    status = DDQ_OK;
-    next_id = 0ULL;
-    if (queue->current_fd < 0 || queue->segment_count == 0U) {
-        status = DDQ_IO_ERROR;
-    } else if (queue->segment_count >= queue->options.max_segments) {
-        status = DDQ_LIMIT;
-    } else if (fsync(queue->current_fd) != 0) {
-        status = DDQ_IO_ERROR;
-    } else {
-        close(queue->current_fd);
-        queue->current_fd = -1;
+    /* 预留轮转保留旧段用于直接读取，普通实例继续关闭旧段后创建新段。 */
+    uint64_t next_id = 0ULL;
+    int status = DDQ_OK;
+    if (queue->current_fd < 0 || queue->segment_count == 0U) status = DDQ_IO_ERROR;
+    else if (queue->segment_count >= writable_segment_limit(queue)) status = queue->reserved_handles != NULL ? DDQ_FULL : DDQ_LIMIT;
+    else if (fsync(queue->current_fd) != 0) status = DDQ_IO_ERROR;
+    else {
         next_id = queue->segments[queue->segment_count - 1U].id;
-        if (next_id == UINT64_MAX) {
-            status = DDQ_LIMIT;
-        } else {
-            next_id += 1ULL;
-            status = create_segment(queue, next_id);
+        if (next_id == UINT64_MAX) status = DDQ_LIMIT;
+        else {
+            if (queue->reserved_handles == NULL) close_current_segment(queue);
+            status = create_segment(queue, next_id + 1ULL);
         }
     }
+    /* 激活或同步结果不确定时停写，恢复重新选择已持久的活动文件。 */
+    if (status != DDQ_OK && status != DDQ_FULL && queue->reserved_handles != NULL) close_current_segment(queue);
     return status;
 }
-
 static int scan_segments(ddq_t *queue)
 {
     /* 只重放清单选择的代，未发布的暂存代不能提供已接受数据。 */
@@ -1335,7 +1494,7 @@ static int replay_segment(ddq_t *queue, uint32_t segment_index, int is_last,
     status = DDQ_OK;
     offset = 0ULL;
     file_size = 0ULL;
-    fd = open(queue->segments[segment_index].path, O_RDWR | O_APPEND);
+    fd = open(queue->segments[segment_index].path, O_RDWR | O_APPEND | O_CLOEXEC);
     if (fd < 0) {
         status = DDQ_IO_ERROR;
     } else if (fstat(fd, &st) != 0 || st.st_size < 0) {
@@ -1482,14 +1641,18 @@ static int append_record(ddq_t *queue, uint16_t type, uint64_t seq,
             status = DDQ_TOO_LARGE;
         } else if (queue->current_fd < 0) {
             status = DDQ_IO_ERROR;
+        } else if (queue->reserved_handles != NULL &&
+                   (status = validate_held_segment(queue, queue->segment_count - 1U)) != DDQ_OK) {
+            /* 命名归属变化后立即停写，禁止继续向已脱离活动路径的 inode 写入。 */
+            close_current_segment(queue);
         } else if (queue->current_offset > 0ULL &&
                    queue->current_offset + total_length >
                        queue->options.segment_bytes) {
             /* 状态或确认历史挤占段预算时先压缩；暂存代不能递归压缩。 */
-            if (queue->segment_count >= queue->options.max_segments &&
+            if (queue->segment_count >= writable_segment_limit(queue) &&
                 queue->staging == 0) {
                 status = compact_queue(queue, total_length, 0U);
-                if (status == DDQ_FULL) {
+                if (status == DDQ_FULL && queue->reserved_handles == NULL) {
                     status = DDQ_LIMIT;
                 }
             }
@@ -1535,8 +1698,7 @@ static int append_record(ddq_t *queue, uint16_t type, uint64_t seq,
                 status = DDQ_IO_ERROR;
             }
             if (status != DDQ_OK && queue->current_fd >= 0) {
-                close(queue->current_fd);
-                queue->current_fd = -1;
+                close_current_segment(queue);
             }
             if (status == DDQ_OK && out_offset != NULL) {
                 *out_offset = offset;
@@ -1579,7 +1741,13 @@ static int read_item_payload(const ddq_t *queue, const ddq_item_t *item,
         (reason != 0 && item->reason_recorded == 0U)) {
         status = DDQ_CORRUPT;
     } else {
-        fd = open(queue->segments[segment_index].path, O_RDONLY);
+        /* 预留实例读回也复用活动段句柄，保持领取、SQLite 提交和 ACK 路径可继续。 */
+        if (queue->reserved_handles != NULL) {
+            if (queue->reserved_handles[segment_index].owned != 0U) {
+                status = validate_held_segment(queue, segment_index);
+                if (status == DDQ_OK) fd = queue->reserved_handles[segment_index].fd;
+            }
+        } else fd = open(queue->segments[segment_index].path, O_RDONLY);
         if (fd < 0) {
             status = DDQ_IO_ERROR;
         } else if (offset > queue->segments[segment_index].size ||
@@ -1626,7 +1794,7 @@ static int read_item_payload(const ddq_t *queue, const ddq_item_t *item,
     if (record != NULL) {
         free(record);
     }
-    if (fd >= 0) {
+    if (fd >= 0 && queue->reserved_handles == NULL) {
         close(fd);
     }
     return status;
@@ -1701,6 +1869,9 @@ static int compact_queue(ddq_t *queue, uint32_t reserve_bytes,
     deadline = operation_deadline(DDQ_OPERATION_TIMEOUT_MS);
     if (queue->current_fd < 0) {
         status = DDQ_IO_ERROR;
+    } else if (queue->reserved_handles != NULL) {
+        /* 应急写入不压缩、不申请新句柄；全 ACK 回收由下一次启用前完成。 */
+        status = DDQ_FULL;
     }
     for (index = 0U;
          index < queue->item_count && status == DDQ_OK; ++index) {
@@ -1848,7 +2019,7 @@ static int compact_queue(ddq_t *queue, uint32_t reserve_bytes,
     }
     if (status == DDQ_OK) {
         /* 发布完成后才替换内存归属，锁描述符始终归原实例。 */
-        close(queue->current_fd);
+        close_current_segment(queue);
         free(queue->segments);
         free(queue->items);
         queue->segments = staged.segments;
@@ -1880,8 +2051,7 @@ static int compact_queue(ddq_t *queue, uint32_t reserve_bytes,
     if (status != DDQ_OK && status != DDQ_FULL &&
         queue->current_fd >= 0) {
         /* 发布或同步失败可能处于未知代，必须重新恢复后才能接受写入。 */
-        close(queue->current_fd);
-        queue->current_fd = -1;
+        close_current_segment(queue);
     }
     return status;
 }
@@ -1897,7 +2067,7 @@ static int plan_capacity_record(const ddq_t *queue,
         status = DDQ_TOO_LARGE;
     } else if (plan->segment_count == 0U ||
                plan->offset + record_bytes > queue->options.segment_bytes) {
-        if (plan->segment_count >= queue->options.max_segments) {
+        if (plan->segment_count >= writable_segment_limit(queue)) {
             status = DDQ_FULL;
         } else {
             plan->segment_count += 1U;
@@ -1991,7 +2161,7 @@ static int check_enqueue_capacity(const ddq_t *queue, uint32_t payload_bytes)
         control_max = state_bytes;
         control_bytes = pending * (state_bytes + DDQ_MIN_RECORD_SIZE) +
                         quarantined * state_bytes;
-        remaining_segments = queue->options.max_segments -
+        remaining_segments = writable_segment_limit(queue) -
                              physical.segment_count;
         if (terminal_bytes > queue->options.segment_bytes / 2U) {
             /* 大原因按两整段保守计费，一段容纳记录，一段承担任意交错造成的空隙。 */
@@ -2031,8 +2201,7 @@ static int resolve_written_item(ddq_t *queue, uint64_t seq, int *out_index)
     if (*out_index < 0) {
         status = DDQ_CORRUPT;
         if (queue->current_fd >= 0) {
-            close(queue->current_fd);
-            queue->current_fd = -1;
+            close_current_segment(queue);
         }
     }
     return status;
@@ -2062,9 +2231,10 @@ int ddq_recover(ddq_t *queue)
     if (queue != NULL) {
         deadline = operation_deadline(DDQ_OPERATION_TIMEOUT_MS);
         if (queue->current_fd >= 0) {
-            close(queue->current_fd);
-            queue->current_fd = -1;
+            close_current_segment(queue);
         }
+        /* 显式恢复可能重新打开文件，完成后按原目标重新预留，失败仍禁止写入。 */
+        (void)close_reserved_handles(queue);
         queue->current_offset = 0ULL;
         queue->item_count = 0U;
         queue->next_seq = 1ULL;
@@ -2104,9 +2274,9 @@ int ddq_recover(ddq_t *queue)
         if (status == DDQ_OK) {
             status = clean_obsolete_files(queue);
         }
+        if (status == DDQ_OK && queue->reserve_target != 0U) status = ddq_reserve_handles(queue, queue->reserve_target);
         if (status != DDQ_OK && queue->current_fd >= 0) {
-            close(queue->current_fd);
-            queue->current_fd = -1;
+            close_current_segment(queue);
         }
     }
     return status;
@@ -2144,6 +2314,7 @@ int ddq_open(ddq_t **out_queue, const char *directory,
                 } else {
                     queue->lock_fd = -1;
                     queue->current_fd = -1;
+                    queue->reserved_directory_fd = -1;
                     queue->options = selected;
                     memcpy(queue->directory, directory,
                            directory_length + 1U);
@@ -2160,7 +2331,7 @@ int ddq_open(ddq_t **out_queue, const char *directory,
                 if (written < 0 || (size_t)written >= sizeof(lock_path)) {
                     status = DDQ_TOO_LARGE;
                 } else {
-                    queue->lock_fd = open(lock_path, O_CREAT | O_RDWR, 0600);
+                    queue->lock_fd = open(lock_path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
                     if (queue->lock_fd < 0) {
                         status = DDQ_IO_ERROR;
                     } else if (flock(queue->lock_fd,
@@ -2189,9 +2360,10 @@ void ddq_close(ddq_t *queue)
     if (queue != NULL) {
         if (queue->current_fd >= 0) {
             fsync(queue->current_fd);
-            close(queue->current_fd);
-            queue->current_fd = -1;
+            close_current_segment(queue);
         }
+        /* 先释放全部本实例预留句柄，再释放目录独占锁。 */
+        (void)close_reserved_handles(queue);
         if (queue->lock_fd >= 0) {
             flock(queue->lock_fd, LOCK_UN);
             close(queue->lock_fd);
@@ -2203,6 +2375,85 @@ void ddq_close(ddq_t *queue)
     }
 }
 
+/* 显式启用真实段和目录句柄预留；全确认旧历史先按既有清单流程回收，序号从不复用。 */
+int ddq_reserve_handles(ddq_t *queue, uint32_t total_segments)
+{
+    ddq_t prepared;
+    struct stat st;
+    char path[PATH_MAX];
+    uint32_t index;
+    uint32_t acknowledged = 0U;
+    uint64_t deadline = operation_deadline(DDQ_OPERATION_TIMEOUT_MS);
+    int status = DDQ_INVALID_ARGUMENT;
+    memset(&prepared, 0, sizeof(prepared));
+    prepared.reserved_directory_fd = -1;
+    if (queue != NULL && total_segments != 0U && total_segments <= queue->options.max_segments) {
+        if (queue->reserved_handles != NULL) status = DDQ_BAD_STATE;
+        else if (queue->current_fd < 0) status = DDQ_IO_ERROR;
+        else {
+            status = DDQ_OK;
+            for (index = 0U; index < queue->item_count && status == DDQ_OK; ++index) {
+                if (deadline_expired(deadline) != 0) status = DDQ_LIMIT;
+                else if (queue->items[index].state == DDQ_ITEM_ACKED) acknowledged += 1U;
+            }
+            if (status == DDQ_OK && acknowledged != 0U && acknowledged == queue->item_count) {
+                status = compact_queue(queue, 0U, 0U);
+            }
+            if (status == DDQ_OK && total_segments < queue->segment_count) status = DDQ_FULL;
+            if (status == DDQ_OK) {
+                prepared = *queue;
+                prepared.reserved_segments = total_segments;
+                prepared.reserved_directory_fd = open(queue->directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+                prepared.reserved_handles = (ddq_reserved_handle_t *)calloc(total_segments, sizeof(*prepared.reserved_handles));
+                if (prepared.reserved_directory_fd < 0) status = DDQ_IO_ERROR;
+                else if (prepared.reserved_handles == NULL) status = DDQ_NO_MEMORY;
+            }
+            for (index = 0U; index < total_segments && status == DDQ_OK; ++index) {
+                ddq_reserved_handle_t *handle = &prepared.reserved_handles[index];
+                if (deadline_expired(deadline) != 0) status = DDQ_LIMIT;
+                else if (index < queue->segment_count) {
+                    /* 当前段借用原句柄，其余活动段提前打开用于故障期间直接读取。 */
+                    if (index + 1U == queue->segment_count) handle->fd = queue->current_fd;
+                    else {
+                        handle->fd = open(queue->segments[index].path, O_RDWR | O_APPEND | O_CLOEXEC | O_NOFOLLOW);
+                        if (handle->fd >= 0) handle->owned = 1U;
+                    }
+                    if (handle->fd < 0 || fstat(handle->fd, &st) != 0) status = DDQ_IO_ERROR;
+                    else if (!S_ISREG(st.st_mode) || st.st_size < 0 ||
+                             (uint64_t)st.st_size != queue->segments[index].size) status = DDQ_CORRUPT;
+                } else {
+                    status = make_reserved_path(path, sizeof(path), queue, index);
+                    if (status == DDQ_OK) {
+                        handle->fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_APPEND | O_CLOEXEC | O_NOFOLLOW, 0600);
+                        if (handle->fd < 0 && errno == EEXIST) handle->fd = open(path, O_RDWR | O_APPEND | O_CLOEXEC | O_NOFOLLOW);
+                        if (handle->fd < 0) status = DDQ_IO_ERROR;
+                        else {
+                            handle->owned = 1U;
+                            handle->spare = 1U;
+                            if (fstat(handle->fd, &st) != 0) status = DDQ_IO_ERROR;
+                            else if (!S_ISREG(st.st_mode) || st.st_size != 0) status = DDQ_CORRUPT;
+                            else if (fsync(handle->fd) != 0) status = DDQ_IO_ERROR;
+                        }
+                    }
+                }
+            }
+            if (status == DDQ_OK && fsync(prepared.reserved_directory_fd) != 0) status = DDQ_IO_ERROR;
+            if (status == DDQ_OK) {
+                prepared.reserved_handles[queue->segment_count - 1U].owned = 1U;
+                queue->reserved_handles = prepared.reserved_handles;
+                queue->reserved_directory_fd = prepared.reserved_directory_fd;
+                queue->reserved_segments = total_segments;
+                queue->reserve_target = total_segments;
+                prepared.reserved_handles = NULL;
+                prepared.reserved_directory_fd = -1;
+            }
+        }
+    }
+    /* 启用失败仅清理这次打开的句柄和空预留，借用的原 current fd 不受影响。 */
+    if (prepared.reserved_handles != NULL) (void)close_reserved_handles(&prepared);
+    else if (prepared.reserved_directory_fd >= 0) close(prepared.reserved_directory_fd);
+    return status;
+}
 int ddq_enqueue(ddq_t *queue, const void *payload, size_t payload_len,
                 uint64_t *out_seq)
 {
