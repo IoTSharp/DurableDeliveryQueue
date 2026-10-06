@@ -2263,7 +2263,9 @@ int ddq_enqueue(ddq_t *queue, const void *payload, size_t payload_len,
     return status;
 }
 
-int ddq_claim(ddq_t *queue, uint32_t lease_ms, ddq_claim_t *out_claim)
+/* 普通领取保持既有跳项语义；严格领取只检查最早未终结项，防止租约或退避打乱顺序。 */
+static int ddq_claim_internal(ddq_t *queue, uint32_t lease_ms,
+                              ddq_claim_t *out_claim, int ordered)
 {
     /* claim 先落盘租约，再更新内存状态，重启后过期租约重新可投递。 */
     uint64_t now;
@@ -2299,6 +2301,16 @@ int ddq_claim(ddq_t *queue, uint32_t lease_ms, ddq_claim_t *out_claim)
                     queue->items[index].state = DDQ_ITEM_AVAILABLE;
                     queue->items[index].lease_until_ms = 0ULL;
                 }
+                /* 严格模式遇到最早活动项即停止扫描，未到期时返回空而不能越过后项。 */
+                if (ordered != 0 &&
+                    (queue->items[index].state == DDQ_ITEM_AVAILABLE ||
+                     queue->items[index].state == DDQ_ITEM_CLAIMED)) {
+                    if (queue->items[index].state == DDQ_ITEM_AVAILABLE &&
+                        queue->items[index].not_before_ms <= now) {
+                        selected = (int)index;
+                    }
+                    break;
+                }
                 if (selected < 0 &&
                     queue->items[index].state == DDQ_ITEM_AVAILABLE &&
                     queue->items[index].not_before_ms <= now) {
@@ -2332,6 +2344,20 @@ int ddq_claim(ddq_t *queue, uint32_t lease_ms, ddq_claim_t *out_claim)
     return status;
 }
 
+/* 既有接口继续允许跳过未到期租约及退避项，保持其他投递通道行为。 */
+int ddq_claim(ddq_t *queue, uint32_t lease_ms, ddq_claim_t *out_claim)
+{
+    int status = ddq_claim_internal(queue, lease_ms, out_claim, 0);
+    return status;
+}
+
+/* 严格顺序接口只能领取最早未确认项；队头未就绪时明确返回 DDQ_EMPTY。 */
+int ddq_claim_ordered(ddq_t *queue, uint32_t lease_ms,
+                       ddq_claim_t *out_claim)
+{
+    int status = ddq_claim_internal(queue, lease_ms, out_claim, 1);
+    return status;
+}
 int ddq_read(ddq_t *queue, uint64_t seq, void *buffer, size_t buffer_cap,
              size_t *out_len)
 {

@@ -73,6 +73,9 @@ int ddq_recover(ddq_t *queue);
 int ddq_enqueue(ddq_t *queue, const void *payload, size_t payload_len,
                 uint64_t *out_seq);
 int ddq_claim(ddq_t *queue, uint32_t lease_ms, ddq_claim_t *out_claim);
+/* 严格顺序领取不越过未到期租约或退避队头；DDQ_EMPTY 可表示队头暂未就绪。 */
+int ddq_claim_ordered(ddq_t *queue, uint32_t lease_ms,
+                       ddq_claim_t *out_claim);
 int ddq_read(ddq_t *queue, uint64_t seq, void *buffer, size_t buffer_cap,
              size_t *out_len);
 int ddq_ack(ddq_t *queue, uint64_t seq);
